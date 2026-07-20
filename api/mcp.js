@@ -14,7 +14,7 @@
 // Fails closed if MCP_AUTH_TOKEN is unset.
 
 const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_INFO = { name: "gemini-image", version: "0.2.0" };
+const SERVER_INFO = { name: "gemini-image", version: "0.3.0" };
 const DEFAULT_MODEL = "gemini-2.5-flash-image";
 
 // Curated fallback if the live models listing is unavailable. These are the
@@ -96,7 +96,7 @@ async function listGeminiModels() {
 
 async function uploadBlob(buffer, mime, name) {
   const { put } = await import("@vercel/blob");
-  const ext = mime.includes("png") ? "png" : "jpg";
+  const ext = mime.includes("webp") ? "webp" : mime.includes("png") ? "png" : "jpg";
   const safe = (name || "image").replace(/[^a-zA-Z0-9._-]/g, "-").slice(0, 60);
   const blob = await put(`gemini/${safe}.${ext}`, buffer, {
     access: "public",
@@ -106,42 +106,133 @@ async function uploadBlob(buffer, mime, name) {
   return blob.url;
 }
 
+// Optional post-processing with sharp: exact resize/crop + format/quality.
+// width+height -> cover-crop to exactly that size; one of them -> proportional.
+// format: "webp" | "jpeg" | "png" (default: keep source format).
+async function postProcess(buffer, mime, opts) {
+  const { width, height, format, quality } = opts || {};
+  if (!width && !height && !format && !quality) return { buffer, mime };
+  let sharp;
+  try {
+    sharp = (await import("sharp")).default;
+  } catch {
+    throw new GenError("Post-processing unavailable: the sharp package is not installed in this deployment.");
+  }
+  let img = sharp(buffer);
+  if (width || height) {
+    img = img.resize({
+      width: width || null,
+      height: height || null,
+      fit: width && height ? "cover" : "inside",
+      position: "attention", // crop toward the most interesting region
+      withoutEnlargement: false,
+    });
+  }
+  const q = Math.min(100, Math.max(1, quality || 82));
+  let fmt = (format || "").toLowerCase();
+  if (fmt === "jpg") fmt = "jpeg";
+  if (fmt === "webp") { img = img.webp({ quality: q }); mime = "image/webp"; }
+  else if (fmt === "jpeg") { img = img.jpeg({ quality: q, mozjpeg: true }); mime = "image/jpeg"; }
+  else if (fmt === "png") { img = img.png(); mime = "image/png"; }
+  else if (quality) {
+    // quality given without format: keep family, apply quality where it applies
+    if (mime.includes("png")) { img = img.png(); }
+    else if (mime.includes("webp")) { img = img.webp({ quality: q }); }
+    else { img = img.jpeg({ quality: q, mozjpeg: true }); mime = "image/jpeg"; }
+  }
+  const out = await img.toBuffer();
+  return { buffer: out, mime };
+}
+
 // ---- tools -------------------------------------------------------------- //
 async function toolGenerateImage(args) {
   let prompt = args.prompt;
   if (!prompt || typeof prompt !== "string") throw new GenError("prompt (string) is required.");
-  // Aspect ratio is a soft hint appended to the prompt (no server-side crop).
+  // Aspect ratio is a soft hint appended to the prompt; width/height do a real crop.
   if (args.aspect_ratio) {
     prompt += `\n\nComposition: ${args.aspect_ratio} aspect ratio, well-framed for that ratio.`;
+  } else if (args.width && args.height) {
+    prompt += `\n\nComposition: framed for a ${args.width}x${args.height} crop.`;
   }
-  const { b64, mime } = await geminiGenerate([{ text: prompt }], args.model);
-  const buffer = Buffer.from(b64, "base64");
-  const url = await uploadBlob(buffer, mime, args.name);
-  return JSON.stringify(
-    { url, mime, bytes: buffer.length, model: args.model || DEFAULT_MODEL, aspect_ratio: args.aspect_ratio || null },
-    null, 2);
+  const { b64, mime: rawMime } = await geminiGenerate([{ text: prompt }], args.model);
+  const processed = await postProcess(Buffer.from(b64, "base64"), rawMime, args);
+  const url = await uploadBlob(processed.buffer, processed.mime, args.name);
+  return JSON.stringify({
+    url, mime: processed.mime, bytes: processed.buffer.length,
+    model: args.model || DEFAULT_MODEL,
+    width: args.width || null, height: args.height || null,
+    aspect_ratio: args.aspect_ratio || null,
+  }, null, 2);
 }
 
 async function toolEditImage(args) {
   const prompt = args.prompt;
   if (!prompt || typeof prompt !== "string") throw new GenError("prompt (string) is required.");
-  const src = await fetchImageBytes(args.image_url);
-  const parts = [
-    { inline_data: { mime_type: src.mime, data: src.b64 } },
-    { text: prompt },
-  ];
-  const { b64, mime } = await geminiGenerate(parts, args.model);
-  const buffer = Buffer.from(b64, "base64");
-  const url = await uploadBlob(buffer, mime, args.name || "edited");
-  return JSON.stringify(
-    { url, mime, bytes: buffer.length, model: args.model || DEFAULT_MODEL, source: args.image_url },
-    null, 2);
+  // Accept one image (image_url) or several (image_urls) — e.g. composite/style transfer.
+  const refs = Array.isArray(args.image_urls) && args.image_urls.length
+    ? args.image_urls
+    : args.image_url ? [args.image_url] : [];
+  if (!refs.length) throw new GenError("Provide image_url or image_urls (at least one).");
+  if (refs.length > 4) throw new GenError("At most 4 input images.");
+  const parts = [];
+  for (const ref of refs) {
+    const src = await fetchImageBytes(ref);
+    parts.push({ inline_data: { mime_type: src.mime, data: src.b64 } });
+  }
+  parts.push({ text: prompt });
+  const { b64, mime: rawMime } = await geminiGenerate(parts, args.model);
+  const processed = await postProcess(Buffer.from(b64, "base64"), rawMime, args);
+  const url = await uploadBlob(processed.buffer, processed.mime, args.name || "edited");
+  return JSON.stringify({
+    url, mime: processed.mime, bytes: processed.buffer.length,
+    model: args.model || DEFAULT_MODEL,
+    width: args.width || null, height: args.height || null,
+    sources: refs,
+  }, null, 2);
 }
 
 async function toolListModels() {
   const models = await listGeminiModels();
   return JSON.stringify({ default: DEFAULT_MODEL, models }, null, 2);
 }
+
+async function toolListImages(args) {
+  const { list } = await import("@vercel/blob");
+  const res = await list({
+    prefix: "gemini/",
+    limit: Math.min(1000, Math.max(1, (args && args.limit) || 100)),
+    cursor: (args && args.cursor) || undefined,
+  });
+  const images = res.blobs.map((b) => ({
+    url: b.url, pathname: b.pathname, size: b.size, uploaded_at: b.uploadedAt,
+  }));
+  const totalBytes = res.blobs.reduce((s, b) => s + (b.size || 0), 0);
+  return JSON.stringify({
+    count: images.length, total_bytes: totalBytes,
+    has_more: res.hasMore || false, cursor: res.cursor || null, images,
+  }, null, 2);
+}
+
+async function toolDeleteImage(args) {
+  const { del } = await import("@vercel/blob");
+  const urls = Array.isArray(args.urls) && args.urls.length
+    ? args.urls
+    : args.url ? [args.url] : [];
+  if (!urls.length) throw new GenError("Provide url or urls (at least one Blob URL to delete).");
+  if (urls.length > 100) throw new GenError("At most 100 URLs per call.");
+  await del(urls);
+  return JSON.stringify({ deleted: urls.length, urls }, null, 2);
+}
+
+// Shared output-shaping properties for generate_image / edit_image.
+const OUTPUT_PROPS = {
+  width: { type: "integer", description: "Optional exact output width in px (with height: cover-crop to exactly WxH, e.g. 1200x630 for OG)." },
+  height: { type: "integer", description: "Optional exact output height in px." },
+  format: { type: "string", enum: ["webp", "jpeg", "jpg", "png"], description: "Optional output format. webp/jpeg strongly reduce file size for blogs." },
+  quality: { type: "integer", description: "Optional 1-100 compression quality for webp/jpeg (default 82)." },
+  name: { type: "string", description: "Optional base filename (a random suffix is added for uniqueness)." },
+  model: { type: "string", description: "Optional Gemini model id (see list_models). Defaults to gemini-2.5-flash-image." },
+};
 
 const TOOLS = {
   generate_image: {
@@ -150,14 +241,15 @@ const TOOLS = {
       name: "generate_image",
       description: "Generate an image with Google Gemini from a text prompt, store it in Vercel " +
         "Blob, and return a public image URL (usable directly as <img src> or an OG image). " +
-        "For clean results, describe subject, style, lighting and say 'no text, no logos'.",
+        "Supports exact sizing (width/height cover-crop) and webp/jpeg compression. " +
+        "For clean results, describe subject, style, lighting and say 'no text, no logos'. " +
+        "Blog hero/OG tip: width 1200, height 630, format webp.",
       inputSchema: {
         type: "object",
         properties: {
           prompt: { type: "string", description: "Text description of the image to generate." },
-          aspect_ratio: { type: "string", description: "Optional composition hint, e.g. '16:9', '1:1', '9:16'. Soft hint (no hard crop)." },
-          name: { type: "string", description: "Optional base filename (a random suffix is added for uniqueness)." },
-          model: { type: "string", description: "Optional Gemini model id (see list_models). Defaults to gemini-2.5-flash-image." },
+          aspect_ratio: { type: "string", description: "Optional composition hint, e.g. '16:9', '1:1', '9:16' (soft hint; use width/height for a hard crop)." },
+          ...OUTPUT_PROPS,
         },
         required: ["prompt"],
         additionalProperties: false,
@@ -168,18 +260,20 @@ const TOOLS = {
     handler: toolEditImage,
     schema: {
       name: "edit_image",
-      description: "Edit an existing image with Google Gemini. Provide the image (a public http(s) URL, " +
-        "e.g. one returned by generate_image, or a data: URL) plus a prompt describing the change " +
-        "(recolor, add/remove an element, change background, restyle). Returns a new public image URL.",
+      description: "Edit existing image(s) with Google Gemini. Provide one image (image_url) or up to 4 " +
+        "(image_urls, e.g. composite two images or transfer style) plus a prompt describing the change " +
+        "(recolor, add/remove an element, change background, restyle). Accepts http(s) URLs — e.g. ones " +
+        "returned by generate_image — or data: URLs. Returns a new public image URL. " +
+        "Supports the same width/height/format/quality output options as generate_image.",
       inputSchema: {
         type: "object",
         properties: {
           image_url: { type: "string", description: "Source image to edit: an http(s) URL or a data: URL." },
+          image_urls: { type: "array", items: { type: "string" }, description: "Multiple source images (max 4) for composites/style transfer. Use instead of image_url." },
           prompt: { type: "string", description: "What to change, e.g. 'make the background dark navy, keep the apple'." },
-          name: { type: "string", description: "Optional base filename for the result (random suffix added)." },
-          model: { type: "string", description: "Optional Gemini model id (see list_models). Defaults to gemini-2.5-flash-image." },
+          ...OUTPUT_PROPS,
         },
-        required: ["image_url", "prompt"],
+        required: ["prompt"],
         additionalProperties: false,
       },
     },
@@ -192,6 +286,39 @@ const TOOLS = {
         "(the :generateContent path). Use the returned id as the `model` argument to generate_image " +
         "or edit_image. Returns the default model too.",
       inputSchema: { type: "object", properties: {}, additionalProperties: false },
+    },
+  },
+  list_images: {
+    handler: toolListImages,
+    schema: {
+      name: "list_images",
+      description: "List images stored in this server's Vercel Blob store (the gemini/ prefix): URL, " +
+        "size, and upload time, plus total bytes. Use to review or clean up generated images.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          limit: { type: "integer", description: "Max images to return (default 100, max 1000)." },
+          cursor: { type: "string", description: "Pagination cursor from a previous call's `cursor` field." },
+        },
+        additionalProperties: false,
+      },
+    },
+  },
+  delete_image: {
+    handler: toolDeleteImage,
+    schema: {
+      name: "delete_image",
+      description: "Delete image(s) from the Vercel Blob store by URL (as returned by generate_image, " +
+        "edit_image, or list_images). Deletion is permanent — any blog post embedding the URL will " +
+        "show a broken image, so check usage before deleting.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "One Blob URL to delete." },
+          urls: { type: "array", items: { type: "string" }, description: "Multiple Blob URLs to delete (max 100). Use instead of url." },
+        },
+        additionalProperties: false,
+      },
     },
   },
 };

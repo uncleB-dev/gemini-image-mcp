@@ -2,7 +2,7 @@
 
 A tiny **remote MCP server** that lets Claude (or any MCP client) **generate images with Google Gemini**. Claude can't create images on its own — connect this and it can. The generated image is stored on **Vercel Blob** and returned as a **public URL** you can drop straight into an `<img src>`, an OG tag, or a blog post.
 
-- **Three tools:** `generate_image` (text → image), `edit_image` (image + prompt → new image), `list_models` (pick a model)
+- **Five tools:** `generate_image` (text → image, exact sizing + webp/jpeg compression), `edit_image` (image(s) + prompt → new image), `list_models`, `list_images`, `delete_image`
 - **Zero framework**, one serverless function (`api/mcp.js`), one dependency (`@vercel/blob`)
 - **Bring your own API key.** Nothing is hard-coded; every secret is read from env.
 - Works as a **claude.ai / Claude Cowork custom connector** (streamable-HTTP + SSE + token auth).
@@ -58,22 +58,27 @@ You can also use it from **Claude Code** by adding it to `.mcp.json` / your MCP 
 | Arg | Type | Required | Notes |
 |---|---|---|---|
 | `prompt` | string | ✅ | Describe subject, style, lighting. Add "no text, no logos" for clean results. |
-| `aspect_ratio` | string | – | Soft composition hint, e.g. `16:9`, `1:1`, `9:16` (no hard crop). |
+| `aspect_ratio` | string | – | Soft composition hint, e.g. `16:9`, `1:1`, `9:16` (use `width`/`height` for a hard crop). |
+| `width` / `height` | integer | – | Exact output size in px. Both set → cover-crop to exactly W×H (e.g. **1200×630** for OG). One set → proportional resize. |
+| `format` | string | – | `webp` \| `jpeg` \| `png`. **webp/jpeg strongly reduce file size** (PNG ~1.2 MB → webp ~150 KB). |
+| `quality` | integer | – | 1–100 compression quality for webp/jpeg (default 82). |
 | `name` | string | – | Base filename; a random suffix is added so every URL is unique. |
 | `model` | string | – | Gemini model id (see `list_models`). Defaults to `gemini-2.5-flash-image`. |
 
-Returns: `{ "url", "mime", "bytes", "model", "aspect_ratio" }`
+Returns: `{ "url", "mime", "bytes", "model", "width", "height", "aspect_ratio" }`
 
-### `edit_image` — image + prompt → new image
-Feed an existing image and describe the change (recolor, add/remove an element, swap background, restyle).
+> **Blog hero/OG recipe:** `width: 1200, height: 630, format: "webp"` — one call, ready to embed.
+
+### `edit_image` — image(s) + prompt → new image
+Feed existing image(s) and describe the change (recolor, add/remove an element, swap background, restyle, composite).
 | Arg | Type | Required | Notes |
 |---|---|---|---|
-| `image_url` | string | ✅ | Source image: an http(s) URL (e.g. one from `generate_image`) or a `data:` URL. |
+| `image_url` | string | ✅* | Source image: an http(s) URL (e.g. one from `generate_image`) or a `data:` URL. |
+| `image_urls` | string[] | ✅* | *Or* up to 4 images — composite two photos, transfer a style, place a product on a background. |
 | `prompt` | string | ✅ | What to change, e.g. "make the background dark navy, keep the apple". |
-| `name` | string | – | Base filename for the result. |
-| `model` | string | – | Gemini model id. Defaults to `gemini-2.5-flash-image`. |
+| `width`/`height`/`format`/`quality`/`name`/`model` | | – | Same output options as `generate_image`. |
 
-Returns: `{ "url", "mime", "bytes", "model", "source" }`
+Returns: `{ "url", "mime", "bytes", "model", "width", "height", "sources" }`
 
 ### `list_models` — pick a model
 No arguments. Returns the image-capable Gemini models (queried live, with a curated fallback) plus the default:
@@ -81,6 +86,22 @@ No arguments. Returns the image-capable Gemini models (queried live, with a cura
 { "default": "gemini-2.5-flash-image", "models": [ { "id": "gemini-2.5-flash-image", "description": "…" } ] }
 ```
 Pass any returned `id` as the `model` argument to `generate_image` / `edit_image`.
+
+### `list_images` — what's in the store
+| Arg | Type | Required | Notes |
+|---|---|---|---|
+| `limit` | integer | – | Max results (default 100, max 1000). |
+| `cursor` | string | – | Pagination cursor from the previous call. |
+
+Returns `{ count, total_bytes, has_more, cursor, images: [{ url, pathname, size, uploaded_at }] }` — handy for reviewing storage usage and finding candidates to clean up.
+
+### `delete_image` — clean up
+| Arg | Type | Required | Notes |
+|---|---|---|---|
+| `url` | string | ✅* | One Blob URL to delete. |
+| `urls` | string[] | ✅* | *Or* up to 100 URLs at once. |
+
+⚠️ Permanent — a blog post embedding a deleted URL will show a broken image. Check usage first.
 
 ---
 
