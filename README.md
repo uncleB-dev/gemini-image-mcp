@@ -13,7 +13,9 @@ A tiny **remote MCP server** that lets Claude (or any MCP client) **generate ima
 
 [![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FuncleB-dev%2Fgemini-image-mcp&env=GOOGLE_AI_API_KEY,MCP_AUTH_TOKEN&envDescription=Your%20Gemini%20API%20key%20%2B%20a%20secret%20token%20that%20guards%20the%20endpoint&project-name=gemini-image-mcp&repository-name=gemini-image-mcp)
 
-Or manually: **Vercel → Add New → Project → import this repo** (Framework preset: *Other*).
+The button clones this repo into **your own GitHub account** and deploys that copy — no manual fork needed.
+
+Or manually: **Fork this repo on GitHub first**, then **Vercel → Add New → Project → import your fork** (Framework preset: *Other*). Vercel's import list only shows repos in your own account, so a fork is required for the manual path.
 
 ### 1. Create a Vercel Blob store
 Project → **Storage → Create Database → Blob** → **Connect** to this project.
