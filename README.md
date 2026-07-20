@@ -2,7 +2,7 @@
 
 A tiny **remote MCP server** that lets Claude (or any MCP client) **generate images with Google Gemini**. Claude can't create images on its own — connect this and it can. The generated image is stored on **Vercel Blob** and returned as a **public URL** you can drop straight into an `<img src>`, an OG tag, or a blog post.
 
-- **One tool:** `generate_image(prompt, aspect_ratio?, name?)` → `{ url, mime, bytes }`
+- **Three tools:** `generate_image` (text → image), `edit_image` (image + prompt → new image), `list_models` (pick a model)
 - **Zero framework**, one serverless function (`api/mcp.js`), one dependency (`@vercel/blob`)
 - **Bring your own API key.** Nothing is hard-coded; every secret is read from env.
 - Works as a **claude.ai / Claude Cowork custom connector** (streamable-HTTP + SSE + token auth).
@@ -52,19 +52,35 @@ You can also use it from **Claude Code** by adding it to `.mcp.json` / your MCP 
 
 ---
 
-## The tool
+## The tools
 
-### `generate_image`
+### `generate_image` — text → image
 | Arg | Type | Required | Notes |
 |---|---|---|---|
 | `prompt` | string | ✅ | Describe subject, style, lighting. Add "no text, no logos" for clean results. |
 | `aspect_ratio` | string | – | Soft composition hint, e.g. `16:9`, `1:1`, `9:16` (no hard crop). |
 | `name` | string | – | Base filename; a random suffix is added so every URL is unique. |
+| `model` | string | – | Gemini model id (see `list_models`). Defaults to `gemini-2.5-flash-image`. |
 
-**Returns** (JSON text):
+Returns: `{ "url", "mime", "bytes", "model", "aspect_ratio" }`
+
+### `edit_image` — image + prompt → new image
+Feed an existing image and describe the change (recolor, add/remove an element, swap background, restyle).
+| Arg | Type | Required | Notes |
+|---|---|---|---|
+| `image_url` | string | ✅ | Source image: an http(s) URL (e.g. one from `generate_image`) or a `data:` URL. |
+| `prompt` | string | ✅ | What to change, e.g. "make the background dark navy, keep the apple". |
+| `name` | string | – | Base filename for the result. |
+| `model` | string | – | Gemini model id. Defaults to `gemini-2.5-flash-image`. |
+
+Returns: `{ "url", "mime", "bytes", "model", "source" }`
+
+### `list_models` — pick a model
+No arguments. Returns the image-capable Gemini models (queried live, with a curated fallback) plus the default:
 ```json
-{ "url": "https://<blob-host>/gemini/hero-abc123.png", "mime": "image/png", "bytes": 812345, "aspect_ratio": "16:9" }
+{ "default": "gemini-2.5-flash-image", "models": [ { "id": "gemini-2.5-flash-image", "description": "…" } ] }
 ```
+Pass any returned `id` as the `model` argument to `generate_image` / `edit_image`.
 
 ---
 
@@ -74,14 +90,14 @@ You can also use it from **Claude Code** by adding it to `.mcp.json` / your MCP 
 
 1. Auth: `Authorization: Bearer <MCP_AUTH_TOKEN>` **or** `?token=<MCP_AUTH_TOKEN>`.
 2. `initialize` / `tools/list` / `tools/call` handled inline.
-3. `generate_image` → calls `gemini-2.5-flash-image:generateContent`, gets base64 image bytes.
+3. `generate_image` / `edit_image` → call `<model>:generateContent` (text, or image + text), get base64 image bytes.
 4. Uploads the bytes to Vercel Blob (`put(..., { access: "public" })`).
 5. Returns the public Blob URL.
 6. Responds as `text/event-stream` when the client's `Accept` header asks for SSE (required by claude.ai), otherwise plain JSON.
 
 ## Cost & notes
 - **You pay** for your own Gemini API usage and Vercel Blob storage/bandwidth. This project has no billing of its own.
-- The model used is `gemini-2.5-flash-image`. Change `GEMINI_MODEL` in `api/mcp.js` to swap it.
+- The default model is `gemini-2.5-flash-image`; call `list_models` to see alternatives, or change `DEFAULT_MODEL` in `api/mcp.js`.
 - Keep `MCP_AUTH_TOKEN` secret — anyone with the URL + token can spend your Gemini quota.
 
 ## License

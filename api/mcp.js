@@ -14,29 +14,84 @@
 // Fails closed if MCP_AUTH_TOKEN is unset.
 
 const PROTOCOL_VERSION = "2024-11-05";
-const SERVER_INFO = { name: "gemini-image", version: "0.1.0" };
-const GEMINI_MODEL = "gemini-2.5-flash-image";
+const SERVER_INFO = { name: "gemini-image", version: "0.2.0" };
+const DEFAULT_MODEL = "gemini-2.5-flash-image";
+
+// Curated fallback if the live models listing is unavailable. These are the
+// Gemini models that produce images via the :generateContent path this server
+// uses (Imagen models use a different :predict endpoint and are not listed).
+const FALLBACK_MODELS = [
+  { id: "gemini-2.5-flash-image", description: "Fast, high-quality image generation and editing (default)." },
+  { id: "gemini-2.0-flash-preview-image-generation", description: "Preview image generation model." },
+];
 
 class GenError extends Error {}
 
-async function geminiImage(prompt) {
+function apiKey() {
   const key = (process.env.GOOGLE_AI_API_KEY || "").trim();
   if (!key) throw new GenError("GOOGLE_AI_API_KEY is not set in Vercel env.");
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`;
+  return key;
+}
+
+// Core call: send a parts array (text and/or inline image) to a model, get an
+// image back. Used by both generate_image and edit_image.
+async function geminiGenerate(parts, model) {
+  const m = (model || DEFAULT_MODEL).replace(/^models\//, "");
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${m}:generateContent?key=${apiKey()}`;
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    body: JSON.stringify({ contents: [{ parts }] }),
   });
   if (!r.ok) throw new GenError(`Gemini API error ${r.status}: ${(await r.text()).slice(0, 400)}`);
   const data = await r.json();
-  const parts = data?.candidates?.[0]?.content?.parts || [];
-  for (const p of parts) {
+  const outParts = data?.candidates?.[0]?.content?.parts || [];
+  for (const p of outParts) {
     if (p.inlineData?.data) {
       return { b64: p.inlineData.data, mime: p.inlineData.mimeType || "image/png" };
     }
   }
-  throw new GenError("No image in Gemini response.");
+  throw new GenError("No image in Gemini response (the model may have returned text only).");
+}
+
+// Fetch bytes for an image reference: an http(s) URL or a data: URL.
+async function fetchImageBytes(ref) {
+  if (typeof ref !== "string" || !ref) throw new GenError("image_url (string) is required.");
+  if (ref.startsWith("data:")) {
+    const m = ref.match(/^data:([^;,]+)?(;base64)?,(.*)$/s);
+    if (!m) throw new GenError("Malformed data: URL.");
+    const mime = m[1] || "image/png";
+    const buf = m[2] ? Buffer.from(m[3], "base64") : Buffer.from(decodeURIComponent(m[3]), "utf8");
+    return { b64: buf.toString("base64"), mime };
+  }
+  if (!/^https?:\/\//i.test(ref)) throw new GenError("image_url must be an http(s) or data: URL.");
+  const r = await fetch(ref);
+  if (!r.ok) throw new GenError(`Could not fetch image_url (${r.status}).`);
+  const mime = (r.headers.get("content-type") || "image/png").split(";")[0];
+  const buf = Buffer.from(await r.arrayBuffer());
+  return { b64: buf.toString("base64"), mime };
+}
+
+async function listGeminiModels() {
+  try {
+    const url = `https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey()}&pageSize=200`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(String(r.status));
+    const data = await r.json();
+    const models = (data.models || [])
+      .filter((mo) => {
+        const name = (mo.name || "").toLowerCase();
+        const methods = mo.supportedGenerationMethods || [];
+        return name.includes("image") && methods.includes("generateContent");
+      })
+      .map((mo) => ({
+        id: (mo.name || "").replace(/^models\//, ""),
+        description: mo.description || mo.displayName || "",
+      }));
+    return models.length ? models : FALLBACK_MODELS;
+  } catch {
+    return FALLBACK_MODELS;
+  }
 }
 
 async function uploadBlob(buffer, mime, name) {
@@ -59,10 +114,33 @@ async function toolGenerateImage(args) {
   if (args.aspect_ratio) {
     prompt += `\n\nComposition: ${args.aspect_ratio} aspect ratio, well-framed for that ratio.`;
   }
-  const { b64, mime } = await geminiImage(prompt);
+  const { b64, mime } = await geminiGenerate([{ text: prompt }], args.model);
   const buffer = Buffer.from(b64, "base64");
   const url = await uploadBlob(buffer, mime, args.name);
-  return JSON.stringify({ url, mime, bytes: buffer.length, aspect_ratio: args.aspect_ratio || null }, null, 2);
+  return JSON.stringify(
+    { url, mime, bytes: buffer.length, model: args.model || DEFAULT_MODEL, aspect_ratio: args.aspect_ratio || null },
+    null, 2);
+}
+
+async function toolEditImage(args) {
+  const prompt = args.prompt;
+  if (!prompt || typeof prompt !== "string") throw new GenError("prompt (string) is required.");
+  const src = await fetchImageBytes(args.image_url);
+  const parts = [
+    { inline_data: { mime_type: src.mime, data: src.b64 } },
+    { text: prompt },
+  ];
+  const { b64, mime } = await geminiGenerate(parts, args.model);
+  const buffer = Buffer.from(b64, "base64");
+  const url = await uploadBlob(buffer, mime, args.name || "edited");
+  return JSON.stringify(
+    { url, mime, bytes: buffer.length, model: args.model || DEFAULT_MODEL, source: args.image_url },
+    null, 2);
+}
+
+async function toolListModels() {
+  const models = await listGeminiModels();
+  return JSON.stringify({ default: DEFAULT_MODEL, models }, null, 2);
 }
 
 const TOOLS = {
@@ -79,10 +157,41 @@ const TOOLS = {
           prompt: { type: "string", description: "Text description of the image to generate." },
           aspect_ratio: { type: "string", description: "Optional composition hint, e.g. '16:9', '1:1', '9:16'. Soft hint (no hard crop)." },
           name: { type: "string", description: "Optional base filename (a random suffix is added for uniqueness)." },
+          model: { type: "string", description: "Optional Gemini model id (see list_models). Defaults to gemini-2.5-flash-image." },
         },
         required: ["prompt"],
         additionalProperties: false,
       },
+    },
+  },
+  edit_image: {
+    handler: toolEditImage,
+    schema: {
+      name: "edit_image",
+      description: "Edit an existing image with Google Gemini. Provide the image (a public http(s) URL, " +
+        "e.g. one returned by generate_image, or a data: URL) plus a prompt describing the change " +
+        "(recolor, add/remove an element, change background, restyle). Returns a new public image URL.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          image_url: { type: "string", description: "Source image to edit: an http(s) URL or a data: URL." },
+          prompt: { type: "string", description: "What to change, e.g. 'make the background dark navy, keep the apple'." },
+          name: { type: "string", description: "Optional base filename for the result (random suffix added)." },
+          model: { type: "string", description: "Optional Gemini model id (see list_models). Defaults to gemini-2.5-flash-image." },
+        },
+        required: ["image_url", "prompt"],
+        additionalProperties: false,
+      },
+    },
+  },
+  list_models: {
+    handler: toolListModels,
+    schema: {
+      name: "list_models",
+      description: "List Google Gemini models that can generate/edit images through this server " +
+        "(the :generateContent path). Use the returned id as the `model` argument to generate_image " +
+        "or edit_image. Returns the default model too.",
+      inputSchema: { type: "object", properties: {}, additionalProperties: false },
     },
   },
 };
