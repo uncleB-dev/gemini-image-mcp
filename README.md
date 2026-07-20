@@ -2,7 +2,7 @@
 
 A tiny **remote MCP server** that lets Claude (or any MCP client) **generate images with Google Gemini**. Claude can't create images on its own — connect this and it can. The generated image is stored on **Vercel Blob** and returned as a **public URL** you can drop straight into an `<img src>`, an OG tag, or a blog post.
 
-- **Five tools:** `generate_image` (text → image, exact sizing + webp/jpeg compression), `edit_image` (image(s) + prompt → new image), `list_models`, `list_images`, `delete_image`
+- **Six tools:** `generate_image` (text → image, exact sizing + webp/jpeg compression), `edit_image` (image(s) + prompt → new image), `list_models`, `list_images`, `fetch_image` (bytes as base64 for sandboxed clients), `delete_image`
 - **Zero framework**, one serverless function (`api/mcp.js`), one dependency (`@vercel/blob`)
 - **Bring your own API key.** Nothing is hard-coded; every secret is read from env.
 - Works as a **claude.ai / Claude Cowork custom connector** (streamable-HTTP + SSE + token auth).
@@ -94,6 +94,17 @@ Pass any returned `id` as the `model` argument to `generate_image` / `edit_image
 | `cursor` | string | – | Pagination cursor from the previous call. |
 
 Returns `{ count, total_bytes, has_more, cursor, images: [{ url, pathname, size, uploaded_at }] }` — handy for reviewing storage usage and finding candidates to clean up.
+
+### `fetch_image` — bring bytes into a sandboxed client
+Some environments (e.g. Claude Cowork's cloud sandbox) can't download the Blob domain directly — but MCP tool results always get through. This tool returns the image as a base64 `data:` URL you can decode to a local file.
+| Arg | Type | Required | Notes |
+|---|---|---|---|
+| `url` | string | ✅ | Image URL to fetch (e.g. a Blob URL from `generate_image`). |
+| `max_dimension` | integer | – | Max px before re-encode (default 1024; `0` = no resize). |
+| `quality` | integer | – | webp quality (default 80). |
+| `raw` | boolean | – | `true` = original bytes untouched (4 MB cap). |
+
+Returns `{ "data_url", "mime", "bytes", "source" }`.
 
 ### `delete_image` — clean up
 | Arg | Type | Required | Notes |

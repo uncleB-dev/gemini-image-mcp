@@ -213,6 +213,40 @@ async function toolListImages(args) {
   }, null, 2);
 }
 
+// Bring image bytes INTO the client as base64. Exists because some sandboxed
+// clients (e.g. Claude Cowork) cannot fetch the Blob domain directly — but MCP
+// tool results always get through. Downscales/compresses by default to keep
+// the payload reasonable.
+async function toolFetchImage(args) {
+  const src = await fetchImageBytes(args.url);
+  let buffer = Buffer.from(src.b64, "base64");
+  let mime = src.mime;
+  const maxDim = args.max_dimension === 0 ? 0 : (args.max_dimension || 1024);
+  const wantsRaw = args.raw === true;
+  if (!wantsRaw) {
+    try {
+      const sharp = (await import("sharp")).default;
+      let img = sharp(buffer);
+      if (maxDim > 0) {
+        img = img.resize({ width: maxDim, height: maxDim, fit: "inside", withoutEnlargement: true });
+      }
+      const q = Math.min(100, Math.max(1, args.quality || 80));
+      img = img.webp({ quality: q });
+      buffer = await img.toBuffer();
+      mime = "image/webp";
+    } catch { /* sharp unavailable: fall through with original bytes */ }
+  }
+  if (buffer.length > 4 * 1024 * 1024) {
+    throw new GenError(`Image too large to return inline (${buffer.length} bytes). ` +
+      "Lower max_dimension/quality, or use raw:false.");
+  }
+  return JSON.stringify({
+    data_url: `data:${mime};base64,${buffer.toString("base64")}`,
+    mime, bytes: buffer.length, source: args.url,
+    note: wantsRaw ? "raw original bytes" : `re-encoded to webp (max ${maxDim || "original"}px)`,
+  }, null, 2);
+}
+
 async function toolDeleteImage(args) {
   const { del } = await import("@vercel/blob");
   const urls = Array.isArray(args.urls) && args.urls.length
@@ -300,6 +334,27 @@ const TOOLS = {
           limit: { type: "integer", description: "Max images to return (default 100, max 1000)." },
           cursor: { type: "string", description: "Pagination cursor from a previous call's `cursor` field." },
         },
+        additionalProperties: false,
+      },
+    },
+  },
+  fetch_image: {
+    handler: toolFetchImage,
+    schema: {
+      name: "fetch_image",
+      description: "Fetch an image's bytes as a base64 data URL through this server. Use when your " +
+        "environment cannot download the Blob domain directly (e.g. a sandboxed client) but you need " +
+        "the actual bytes locally — save the data URL's base64 part to a file. By default re-encodes " +
+        "to webp at max 1024px to keep the payload small; set raw:true for the untouched original.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          url: { type: "string", description: "Image URL to fetch (e.g. a Blob URL from generate_image)." },
+          max_dimension: { type: "integer", description: "Max width/height in px before re-encoding (default 1024; 0 = no resize)." },
+          quality: { type: "integer", description: "webp quality 1-100 (default 80)." },
+          raw: { type: "boolean", description: "true = return original bytes untouched (may be large; 4 MB cap)." },
+        },
+        required: ["url"],
         additionalProperties: false,
       },
     },
