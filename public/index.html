@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="robots" content="noindex, nofollow" />
+  <title>Gemini Image MCP</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 8vh auto; padding: 0 1.25rem; color: #1a1a1a; line-height: 1.6; }
+    code { background: #f0f0f0; padding: .1rem .35rem; border-radius: 4px; }
+    .muted { color: #666; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <h1>Gemini Image MCP</h1>
+  <p>Remote MCP endpoint for generating images with Google Gemini.</p>
+  <p>MCP endpoint: <code>POST /api/mcp</code> — requires <code>Authorization: Bearer &lt;token&gt;</code> or <code>?token=</code>.</p>
+  <p class="muted">This service holds no public data. It wraps the Gemini image API as a single MCP tool
+     (generate_image), stores the result on Vercel Blob, and returns a public image URL.</p>
+</body>
+</html>

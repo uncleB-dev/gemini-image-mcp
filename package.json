@@ -1,0 +1,13 @@
+{
+  "name": "gemini-image-mcp",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remote MCP server that generates images with Google Gemini and hosts them on Vercel Blob.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@vercel/blob": "^0.27.0"
+  }
+}
